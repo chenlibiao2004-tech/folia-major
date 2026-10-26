@@ -3,6 +3,7 @@
   "rewrites": [
     { "source": "/api/qq/:path*", "destination": "/api/qq?path=/:path*" },
     { "source": "/api/netease/:path*", "destination": "https://api-enhanced-chenlibiao2004-4916.vercel.app/:path*" },
+    { "source": "/sso-api/:path*", "destination": "https://api-enhanced-chenlibiao2004-4916.vercel.app/sso-api/:path*" },
     { "source": "/api/kugou/:path*", "destination": "https://ku-gou-music-api-chenlibiao2004-4916.vercel.app/:path*" }
   ]
 }
