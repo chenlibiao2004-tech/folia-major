@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { saveProviderAccountSnapshot } from '@/services/onlineMusic/providerAccountCache';
-import { omni } from '@/services/onlineMusic/omni';
+import { omni, PLAYLIST_ADD_BATCH } from '@/services/onlineMusic/omni';
 import { registerOnlineMusicProvider, unregisterOnlineMusicProvider } from '@/services/onlineMusic/providerRegistry';
 import { useOnlineProviderAccountStore } from '@/stores/useOnlineProviderAccountStore';
 import type { UnifiedSong } from '@/types';
@@ -121,6 +121,32 @@ describe('omni routing', () => {
         const target = song(providerId, 'chorus-song');
         await expect(omni.getChorusRanges(target)).resolves.toEqual([{ startTime: 10, endTime: 20 }]);
         expect(getChorusRanges).toHaveBeenCalledWith('chorus-song');
+    });
+
+    it("routes a listening ranking entry to its owner's ranking for its span, and offers no change to it", async () => {
+        const getListeningRankTracks = vi.fn(async () => ({ items: [{ ...song(providerId, 'ranked'), listenCount: 4 }], hasMore: false, nextOffset: 1 }));
+        const getPlaylistTracks = vi.fn(async () => ({ items: [], hasMore: false, nextOffset: 0 }));
+        registerOnlineMusicProvider({
+            ...provider(providerId, { searchSongs: async () => ({ items: [], hasMore: false, nextOffset: 0 }) }),
+            capabilities: { ...capabilities, mutations: true, playlistSubscription: true, playlistTrackMutations: true },
+            catalog: { getListeningRankTracks, getPlaylistTracks },
+            mutations: { subscribePlaylist: vi.fn(), updatePlaylistTracks: vi.fn() } as unknown as OnlineMusicProvider['mutations'],
+        });
+        const entry: ProviderCollection = {
+            providerId, id: 'listening-rank-week-user', type: 'listening_rank', listeningRank: 'week', name: 'Week', creator: { id: 'user', nickname: 'Listener' },
+        };
+
+        await expect(omni.getCollectionTracks(entry, { limit: 150, offset: 0 })).resolves.toMatchObject({ items: [{ listenCount: 4 }] });
+        expect(getListeningRankTracks).toHaveBeenCalledWith('week', 150, 0, entry);
+        expect(getPlaylistTracks).not.toHaveBeenCalled();
+        // An entry that names no span reads nothing.
+        await expect(omni.getCollectionTracks({ ...entry, listeningRank: undefined }, { limit: 150, offset: 0 })).resolves.toMatchObject({ items: [] });
+        expect(getListeningRankTracks).toHaveBeenCalledTimes(1);
+        // A platform that subscribes and edits playlists does neither to its ranking.
+        expect(omni.canSubscribeCollection({ ...entry, type: 'playlist' })).toBe(true);
+        expect(omni.canSubscribeCollection(entry)).toBe(false);
+        expect(omni.canEditCollectionTracks({ ...entry, type: 'playlist' })).toBe(true);
+        expect(omni.canEditCollectionTracks(entry)).toBe(false);
     });
 
     it('rejects a late active-provider result after invalidation', async () => {
@@ -315,6 +341,74 @@ describe('omni routing', () => {
 
         expect(updateTracks).toHaveBeenCalledWith('add', collection, [target]);
         expect(getUserPlaylists).toHaveBeenCalledWith('user', 50, 0);
+    });
+
+    it('adds several songs to one playlist in a single provider request', async () => {
+        const updateTracks = vi.fn(async () => undefined);
+        registerOnlineMusicProvider({
+            ...provider(providerId, { searchSongs: async () => ({ items: [], hasMore: false, nextOffset: 0 }) }),
+            capabilities: { ...capabilities, mutations: true, playlistTrackMutations: true },
+            mutations: { updatePlaylistTracks: updateTracks },
+        });
+        const collection: ProviderCollection = { providerId, id: 'batch', name: 'Batch', type: 'playlist' };
+        const songs = [song(providerId, 'one'), song(providerId, 'two'), song(providerId, 'three')];
+
+        await omni.addSongsToPlaylist(songs, collection);
+
+        expect(updateTracks).toHaveBeenCalledTimes(1);
+        expect(updateTracks).toHaveBeenCalledWith('add', collection, songs);
+    });
+
+    it('splits a long batch into requests of PLAYLIST_ADD_BATCH, in order', async () => {
+        const updateTracks = vi.fn(async () => undefined);
+        registerOnlineMusicProvider({
+            ...provider(providerId, { searchSongs: async () => ({ items: [], hasMore: false, nextOffset: 0 }) }),
+            capabilities: { ...capabilities, mutations: true, playlistTrackMutations: true },
+            mutations: { updatePlaylistTracks: updateTracks },
+        });
+        const collection: ProviderCollection = { providerId, id: 'long', name: 'Long', type: 'playlist' };
+        const songs = Array.from({ length: PLAYLIST_ADD_BATCH * 2 + 3 }, (_, index) => song(providerId, `s${index}`));
+
+        await omni.addSongsToPlaylist(songs, collection);
+
+        expect(updateTracks.mock.calls.map(call => (call as unknown[])[2])).toEqual([
+            songs.slice(0, PLAYLIST_ADD_BATCH),
+            songs.slice(PLAYLIST_ADD_BATCH, PLAYLIST_ADD_BATCH * 2),
+            songs.slice(PLAYLIST_ADD_BATCH * 2),
+        ]);
+    });
+
+    it('still refreshes the account playlists when a later batch fails', async () => {
+        const updateTracks = vi.fn()
+            .mockResolvedValueOnce(undefined)
+            .mockRejectedValueOnce(new Error('rate limited'));
+        const getUserPlaylists = vi.fn(async () => ({ items: [], hasMore: false, nextOffset: 0 }));
+        registerOnlineMusicProvider({
+            ...provider(providerId, { searchSongs: async () => ({ items: [], hasMore: false, nextOffset: 0 }) }),
+            capabilities: { ...capabilities, mutations: true, playlistTrackMutations: true },
+            mutations: { updatePlaylistTracks: updateTracks },
+            library: { getUserPlaylists },
+        });
+        useOnlineProviderAccountStore.getState().updateAccount(providerId, { user: { id: 'user', nickname: 'User' } });
+        const collection: ProviderCollection = { providerId, id: 'partial', name: 'Partial', type: 'playlist' };
+        const songs = Array.from({ length: PLAYLIST_ADD_BATCH + 1 }, (_, index) => song(providerId, `p${index}`));
+
+        await expect(omni.addSongsToPlaylist(songs, collection)).rejects.toThrow('rate limited');
+        await vi.waitFor(() => expect(getUserPlaylists).toHaveBeenCalled());
+    });
+
+    it('refuses the whole batch when one song is of another provider', async () => {
+        const updateTracks = vi.fn(async () => undefined);
+        registerOnlineMusicProvider({
+            ...provider(providerId, { searchSongs: async () => ({ items: [], hasMore: false, nextOffset: 0 }) }),
+            capabilities: { ...capabilities, mutations: true, playlistTrackMutations: true },
+            mutations: { updatePlaylistTracks: updateTracks },
+        });
+        const collection: ProviderCollection = { providerId, id: 'batch', name: 'Batch', type: 'playlist' };
+
+        await expect(omni.addSongsToPlaylist([song(providerId, 'one'), song('netease', 'stray')], collection))
+            .rejects.toMatchObject({ code: 'unsupported' });
+        expect(updateTracks).not.toHaveBeenCalled();
     });
 
     it('rejects a playlist that its provider marks as non-mutable', async () => {

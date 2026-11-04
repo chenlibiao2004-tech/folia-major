@@ -39,6 +39,9 @@ const {
   isPointOverRemoteControlStrip,
   clampRemoteControlWindowX,
   resolveRemoteControlWindowPosition,
+  getRemoteControlQueueExpansion,
+  getRemoteControlWindowBounds,
+  getRemoteControlCardPosition,
 } = require('./remoteControlWindowGeometry.cjs');
 const wallpaperWatchdogModule = require('./wallpaper/wallpaperWatchdog.cjs');
 const { requestWallpaperEntryConfirmation } = require('./wallpaper/wallpaperEntryRequest.cjs');
@@ -66,6 +69,7 @@ const { createKugouApiBridge } = require('./kugou/kugouApiBridge.cjs');
 const { createExternalUrlOpener } = require('./externalUrlPolicy.cjs');
 const { createSenderGuardedHandler } = require('./ipcAccessGuard.cjs');
 const { createQishuiApiBridge } = require('./qishui/qishuiApiBridge.cjs');
+const { createFnmusicApiBridge, FN_MUSIC_SCHEME, FN_MUSIC_PRIVILEGED_SCHEME } = require('./fnmusic/fnmusicApiBridge.cjs');
 const { createQishuiMediaPolicy } = require('./qishui/mediaCors.cjs');
 const { createBodianApiBridge } = require('./bodian/bodianApiBridge.cjs');
 const { createBodianMediaPolicy } = require('./bodian/mediaCors.cjs');
@@ -165,6 +169,7 @@ protocol.registerSchemesAsPrivileged([
   MOD_PROTOCOL_PRIVILEGED_SCHEME,
   YTM_AUDIO_PRIVILEGED_SCHEME,
   SPOTIFY_AUDIO_PRIVILEGED_SCHEME,
+  FN_MUSIC_PRIVILEGED_SCHEME,
 ]);
 
 // Trusts only the known KuGou media CDN hostname mismatch while preserving TLS checks elsewhere.
@@ -353,6 +358,9 @@ process.on('exit', () => hifiSession.killSync());
 // The bridge refuses Linux's plaintext `basic_text` fallback and degrades to an in-memory session.
 const kugouApiBridge = createKugouApiBridge({ store, safeStorage });
 const qishuiMediaPolicy = createQishuiMediaPolicy();
+// 飞牛音乐桥：服务器与凭据由主进程 safeStorage 加密保存（渲染进程只发操作）；播放/封面走
+// 自定义协议（协议 handler 实时转发，无需本地 HTTP 代理、无需启动时恢复）。
+const fnMusicApiBridge = createFnmusicApiBridge({ store, safeStorage });
 const qishuiApiBridge = createQishuiApiBridge({ store, safeStorage, fetch: (url, options) => electronNet.fetch(url, options),
   onAudioSource: url => qishuiMediaPolicy.register(url),
 });
@@ -2286,9 +2294,35 @@ const mainLocale = {
     crashOpenFolder: 'Buka Folder Log',
     crashClose: 'Tutup',
   },
+  vi: {
+    trayShowWindow: 'Hiện cửa sổ',
+    trayHideWindow: 'Ẩn cửa sổ',
+    trayOpenRemote: 'Cửa sổ điều khiển',
+    trayUnlockRemote: 'Mở khóa cửa sổ điều khiển',
+    trayTransparentBackground: 'Nền trong suốt',
+    trayToggleClickThrough: 'Nhấp xuyên qua',
+    trayAlwaysOnTop: 'Luôn trên cùng',
+    trayAlwaysOnTopUnavailable: 'Luôn trên cùng (không khả dụng trên Wayland)',
+    trayHideTaskbar: 'Ẩn biểu tượng thanh tác vụ',
+    trayDesktopLyricMode: 'Lời bài hát màn hình chính',
+    trayToggleWallpaperMode: 'Chế độ hình nền',
+    trayWallpaperDisplay: 'Màn hình hiển thị hình nền',
+    trayWallpaperDisplayAuto: 'Tự động',
+    trayWallpaperDisplayPrimary: 'Màn hình chính',
+    trayResetWindow: 'Đặt lại cửa sổ',
+    trayQuit: 'Thoát',
+    dialogImportTitle: 'Không thể nhập thư mục này',
+    dialogImportMessage: 'Không thể nhập trực tiếp thư mục hệ thống hoặc thư mục người dùng thông thường.\nVui lòng chọn một thư mục chuyên lưu nhạc.',
+    dialogChooseOther: 'Chọn thư mục khác',
+    dialogCancel: 'Hủy',
+    crashTitle: 'Folia đã gặp sự cố',
+    crashMessage: 'Ứng dụng đã gặp sự cố và tệp nhật ký đã được lưu. Gửi nhật ký cho nhà phát triển sẽ giúp giải quyết vấn đề.',
+    crashOpenFolder: 'Mở thư mục nhật ký',
+    crashClose: 'Đóng',
+  },
 };
 
-// Maps an arbitrary BCP 47 tag onto one of the four locales the main process ships.
+// Maps an arbitrary BCP 47 tag onto one of the five locales the main process ships.
 // Returns null for unsupported tags so callers can keep walking the preference list.
 function normalizeMainLocaleKey(value) {
   if (typeof value !== 'string' || !value) {
@@ -2298,6 +2332,9 @@ function normalizeMainLocaleKey(value) {
   const lowered = value.toLowerCase();
   if (lowered === 'in' || lowered.startsWith('id')) {
     return 'in';
+  }
+  if (lowered === 'vi' || lowered.startsWith('vi-')) {
+    return 'vi';
   }
   // Same script/region split the renderer applies in src/i18n/config.ts: an explicit
   // Hant / TW / HK / MO subtag means traditional, a bare `zh` stays simplified.
@@ -2348,7 +2385,7 @@ function detectSystemLocaleKey() {
 // modules with their own dialog copy (the mod loader) can ask for the key.
 function getMainLocaleKey() {
   const stored = store.get(APP_LOCALE_KEY);
-  if (stored === 'zh-CN' || stored === 'zh-TW' || stored === 'en' || stored === 'in') {
+  if (stored === 'zh-CN' || stored === 'zh-TW' || stored === 'en' || stored === 'in' || stored === 'vi') {
     return stored;
   }
   return detectSystemLocaleKey();
@@ -2529,9 +2566,10 @@ let wallpaperModeRelaunchGeneration = 0;
 const x11WallpaperWindows = new WeakSet();
 // Must match CLICK_THROUGH_UNLOCK_HOTSPOT in src/utils/clickThroughUnlockHotspot.ts (the renderer
 // runs the same hit test on mousemove). The width covers the unlock button both at right-[180px]
-// and at right-[224px] (titlebar showing the fullscreen button).
+// and at right-[224px] (titlebar showing the fullscreen button), plus the media buttons that come
+// up to its left while click-through is on.
 const MAIN_WINDOW_CLICK_THROUGH_UNLOCK_HOTSPOT = {
-  width: 84,
+  width: 172,
   height: 40,
   rightInset: 176,
   topInset: 4,
@@ -5131,6 +5169,12 @@ function clearPendingWindowPlaybackHandoffRequests() {
   }
 }
 
+/** The snapshot without its queue, for sends that do not change it (the remote keeps the last one). */
+function withoutRemoteControlQueue(snapshot) {
+  const { queue: _queue, ...rest } = snapshot;
+  return rest;
+}
+
 function patchRemoteControlSnapshot(patch) {
   if (!latestRemoteControlSnapshot) {
     return;
@@ -5141,7 +5185,7 @@ function patchRemoteControlSnapshot(patch) {
     ...latestRemoteControlSnapshot,
     ...patch,
   };
-  sendRemoteControlSnapshot(latestRemoteControlSnapshot);
+  sendRemoteControlSnapshot(withoutRemoteControlQueue(latestRemoteControlSnapshot));
 }
 
 function publishMainWindowClickThroughState() {
@@ -5344,10 +5388,11 @@ function keepRemoteControlCoverOnScreen(win, event, newBounds) {
   if (x !== newBounds.x) {
     // Windows then keeps the window where this puts it, and the drag slides along the edge.
     event.preventDefault();
-    // setBounds rather than setPosition: this window's size is fixed for good (resizable: false,
-    // min === max === REMOTE_CONTROL_WINDOW_WIDTH/HEIGHT). Stating it on every move keeps the
-    // window the size the page is laid out to, instead of leaving the platform to re-derive it.
-    win.setBounds({ x, y: newBounds.y, width: REMOTE_CONTROL_WINDOW_WIDTH, height: REMOTE_CONTROL_WINDOW_HEIGHT });
+    // setBounds rather than setPosition: this window's size is fixed (resizable: false, min ===
+    // max; only showing the queue changes it). Stating it on every move keeps the window the size
+    // the page is laid out to, instead of leaving the platform to re-derive it.
+    const { width, height } = getRemoteControlWindowBounds(newBounds, remoteControlQueueExpansion);
+    win.setBounds({ x, y: newBounds.y, width, height });
   }
 }
 
@@ -5361,8 +5406,60 @@ function bringRemoteControlCoverOnScreen(win) {
   const bounds = win.getBounds();
   const x = clampRemoteControlWindowX(bounds, screen.getAllDisplays().map(display => display.bounds), true);
   if (x !== bounds.x) {
-    win.setBounds({ x, y: bounds.y, width: REMOTE_CONTROL_WINDOW_WIDTH, height: REMOTE_CONTROL_WINDOW_HEIGHT });
+    const { width, height } = getRemoteControlWindowBounds(bounds, remoteControlQueueExpansion);
+    win.setBounds({ x, y: bounds.y, width, height });
   }
+}
+
+// The play queue opens below or above the card, wherever the screen has room
+// (getRemoteControlQueueExpansion), so the window grows that way and the card stays where it is.
+// While shown it keeps that side; a queue that gets longer or shorter only changes the height.
+// What is remembered as the window's spot is always the card's (getRemoteControlCardPosition).
+let remoteControlQueueExpansion = null;
+
+function resizeRemoteControlWindow(win, bounds) {
+  const current = win.getBounds();
+  // min === max: open the limit on the side the window moves to first, or the platform clamps it.
+  if (bounds.height >= current.height) {
+    win.setMaximumSize(bounds.width, bounds.height);
+    win.setMinimumSize(bounds.width, bounds.height);
+  } else {
+    win.setMinimumSize(bounds.width, bounds.height);
+    win.setMaximumSize(bounds.width, bounds.height);
+  }
+  win.setBounds(bounds);
+}
+
+/**
+ * Shows the queue `wantedHeight` px tall (null hides it); returns where it went, or null. With
+ * `preview` it only says where it would go: the page anchors the card on that side first, so the
+ * window can then grow without the card moving. `direction` is the side the page anchored for; it
+ * is kept while it has room, as is the side of a queue already shown.
+ */
+function setRemoteControlQueueExpansion(win, wantedHeight, { preview = false, direction = null } = {}) {
+  if (!win || win.isDestroyed()) {
+    return null;
+  }
+
+  const card = getRemoteControlCardPosition(win.getBounds(), remoteControlQueueExpansion);
+  const cardBounds = getRemoteControlWindowBounds(card, null);
+  const next = Number.isFinite(wantedHeight) && wantedHeight > 0
+    ? getRemoteControlQueueExpansion(
+      cardBounds,
+      onWayland ? null : screen.getDisplayMatching(cardBounds).workArea,
+      wantedHeight,
+      remoteControlQueueExpansion?.direction ?? direction,
+    )
+    : null;
+  if (preview) {
+    return next;
+  }
+  if (next?.direction !== remoteControlQueueExpansion?.direction || next?.height !== remoteControlQueueExpansion?.height) {
+    console.info('[RemoteControl] Queue', next ? `shown ${next.direction}, ${next.height} px` : 'hidden');
+  }
+  remoteControlQueueExpansion = next;
+  resizeRemoteControlWindow(win, getRemoteControlWindowBounds(card, next));
+  return next;
 }
 
 // Wallpaper mode (Wayland): windowtolayer turns the first window it sees into the layer
@@ -5407,7 +5504,7 @@ function createRemoteControlWindow() {
 
   ensureWallpaperLayerHeldByMainWindow();
 
-  // Never resized after this: the idle look and the card in use are both drawn in this size.
+  // Only resized to show the play queue: the idle look and the card in use are both drawn in this size.
   const workArea = screen.getPrimaryDisplay().workArea;
   const position = getRestoredRemoteControlWindowPosition()
     ?? getInitialRemoteControlWindowPosition(workArea);
@@ -5444,6 +5541,7 @@ function createRemoteControlWindow() {
   });
 
   remoteControlWindow = win;
+  remoteControlQueueExpansion = null;
   remoteControlPointerInside = false;
   remoteControlMouseIgnored = false;
   clearInterval(remoteControlPointerTimer);
@@ -5471,7 +5569,7 @@ function createRemoteControlWindow() {
   const persistRemoteControlPosition = () => {
     clearRemoteControlPositionSaveTimer();
     if (!win.isDestroyed()) {
-      const { x, y } = win.getBounds();
+      const { x, y } = getRemoteControlCardPosition(win.getBounds(), remoteControlQueueExpansion);
       store.set(REMOTE_CONTROL_WINDOW_POSITION_SETTING_KEY, { x, y });
     }
   };
@@ -5497,6 +5595,7 @@ function createRemoteControlWindow() {
     clearRemoteControlPositionSaveTimer();
     if (remoteControlWindow === win) {
       remoteControlWindow = null;
+      remoteControlQueueExpansion = null;
       clearInterval(remoteControlPointerTimer);
       remoteControlPointerTimer = null;
     }
@@ -6007,6 +6106,7 @@ app.whenReady().then(async () => {
   localCoverAssetStore.registerProtocolHandler(protocol, electronNet);
   protocol.handle(YTM_AUDIO_SCHEME, request => ytmApiBridge.handleAudioRequest(request));
   protocol.handle(SPOTIFY_AUDIO_SCHEME, request => spotifyApiBridge.handleAudioRequest(request));
+  protocol.handle(FN_MUSIC_SCHEME, request => fnMusicApiBridge.handleProtocolRequest(request));
   // Transcode fallback is an optional degradation path; a failure preparing it must never keep
   // the rest of this handler, createWindow() included, from running.
   try {
@@ -6442,7 +6542,7 @@ ipcMain.handle('playback-display-sleep-set-active', (event, active) => {
 });
 
 ipcMain.handle('set-app-locale', (event, localeKey) => {
-  if (localeKey === 'zh-CN' || localeKey === 'zh-TW' || localeKey === 'en' || localeKey === 'in') {
+  if (localeKey === 'zh-CN' || localeKey === 'zh-TW' || localeKey === 'en' || localeKey === 'in' || localeKey === 'vi') {
     store.set(APP_LOCALE_KEY, localeKey);
     refreshTrayMenu();
   }
@@ -6977,6 +7077,33 @@ ipcMain.handle('qishui-api-request', (event, operation, params) => {
   if (!isTrustedMainWindowContents(event.sender)) return { ok: false, error: { code: 'unavailable', message: 'Untrusted Qishui request' } };
   return qishuiApiBridge.request(operation, params);
 });
+
+// 飞牛音乐请求桥：服务器与凭据保存在主进程，渲染进程只发操作；Cookie 认证头、
+// 自签名证书容忍都在主进程桥内完成（用受信窗口守卫）。
+ipcMain.handle('fnmusic-api-request', createSenderGuardedHandler({
+  channel: 'fnmusic-api-request',
+  isTrusted: (event) => isTrustedMainWindowContents(event.sender),
+  handler: (_event, operation, params) => {
+    const handlerByOperation = {
+      login: () => fnMusicApiBridge.login(params),
+      logout: () => fnMusicApiBridge.logout(params),
+      request: () => fnMusicApiBridge.request(params),
+      stream: () => fnMusicApiBridge.stream(params),
+      coverUrl: () => fnMusicApiBridge.coverUrl(params),
+      getStatus: () => {
+        const status = fnMusicApiBridge.getStatus();
+        return { ok: true, data: status };
+      },
+    };
+    const handler = handlerByOperation[operation];
+    if (!handler) return { ok: false, error: { code: 'unsupported', message: `Unknown FnMusic operation: ${operation}` } };
+    return handler();
+  },
+}));
+
+// 状态查询走异步 fnmusic-api-request('getStatus')，不再用 sendSync 同步 IPC（避免渲染主线程
+// 阻塞在 safeStorage 解密上；本地代理已删除，注释里"要同步拿本地代理端口"的前提已不存在）。
+
 ipcMain.handle('bodian-api-request', (event, operation, params) => {
   if (!isTrustedMainWindowContents(event.sender)) {
     return { ok: false, error: { code: 'unavailable', message: 'Untrusted Bodian request' } };
@@ -7347,6 +7474,14 @@ ipcMain.handle('stage-complete-player-queue', (event, result) => {
   return stageApi.completeStagePlayerQueueRequest(result);
 });
 
+ipcMain.handle('stage-complete-player-search', (event, result) => {
+  if (!isTrustedMainWindowContents(event.sender)) {
+    throw new Error('Untrusted renderer attempted to complete a Stage player search request.');
+  }
+
+  return stageApi.completeStagePlayerSearchRequest(result);
+});
+
 // Created on first use: globalShortcut only works once the app is ready, and the renderer asks
 // only after its window has loaded.
 let globalShortcutController = null;
@@ -7491,6 +7626,21 @@ ipcMain.handle('remote-control-get-pointer-inside', (event) => {
   return remoteControlPointerInside;
 });
 
+ipcMain.handle('remote-control-set-queue-expansion', (event, wantedHeight, options) => {
+  if (!isTrustedRemoteControlContents(event.sender)) {
+    throw new Error('Untrusted renderer attempted to resize the remote control window.');
+  }
+
+  return setRemoteControlQueueExpansion(
+    remoteControlWindow,
+    typeof wantedHeight === 'number' ? wantedHeight : null,
+    {
+      preview: options?.preview === true,
+      direction: options?.direction === 'up' || options?.direction === 'down' ? options.direction : null,
+    },
+  );
+});
+
 ipcMain.handle('remote-control-publish-snapshot', (event, snapshot) => {
   if (!isTrustedMainWindowContents(event.sender)) {
     throw new Error('Untrusted renderer attempted to publish remote control state.');
@@ -7501,13 +7651,20 @@ ipcMain.handle('remote-control-publish-snapshot', (event, snapshot) => {
       ...(latestRemoteControlSnapshot && !Object.prototype.hasOwnProperty.call(snapshot, 'lyrics')
         ? { lyrics: latestRemoteControlSnapshot.lyrics }
         : {}),
+      // The queue, like the lyrics, is only sent when it changed.
+      ...(latestRemoteControlSnapshot && !Object.prototype.hasOwnProperty.call(snapshot, 'queue')
+        ? { queue: latestRemoteControlSnapshot.queue }
+        : {}),
       ...snapshot,
       mainWindowClickThroughEnabled,
       mainWindowAlwaysOnTop,
     }
     : null;
   if (latestRemoteControlSnapshot) {
-    sendRemoteControlSnapshot(latestRemoteControlSnapshot);
+    // The remote keeps the queue it was last sent: forward it only when this publish carried it.
+    sendRemoteControlSnapshot(Object.prototype.hasOwnProperty.call(snapshot, 'queue')
+      ? latestRemoteControlSnapshot
+      : withoutRemoteControlQueue(latestRemoteControlSnapshot));
   }
   return true;
 });

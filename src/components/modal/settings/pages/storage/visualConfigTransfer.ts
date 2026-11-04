@@ -2,7 +2,9 @@ import { applyVisualizerTuningsToSettings } from '../../../../visualizer/tuningR
 import { importFoliumParams, snapshotFoliumParams } from '../../../../../mods/params/paramStore';
 import { buildVisualSettingsConfig } from '../../../../../services/obs/visualSettingsConfig';
 import { isThemeGenerationSource, type ThemeGenerationSource } from '../../../../../services/themePreferences';
+import { useLatticeSettingsStore } from '../../../../../stores/useLatticeSettingsStore';
 import { useLibraryWallLookStore } from '../../../../../stores/useLibraryWallLookStore';
+import { usePlayerChromeSettingsStore } from '../../../../../stores/usePlayerChromeSettingsStore';
 import { useStageSettingsStore } from '../../../../../stores/useStageSettingsStore';
 import { useThemeSettingsStore } from '../../../../../stores/useThemeSettingsStore';
 import { useTypographySettingsStore } from '../../../../../stores/useTypographySettingsStore';
@@ -10,6 +12,7 @@ import { useVisualizerAssetStore } from '../../../../../stores/useVisualizerAsse
 import { useVisualizerSettingsStore } from '../../../../../stores/useVisualizerSettingsStore';
 import type { DualTheme, ThemeMode, UrlBackgroundItem } from '../../../../../types';
 import { decompressConfig, readSavedCustomTheme } from '../../../../../utils/appearanceCodec';
+import { parseSubtitleOverlayLayout } from '../../../../../utils/lyrics/subtitleOverlayLayout';
 import { ACTIVATE_CUSTOM_THEME_KEY, buildImportPlan, THEME_DARK_KEY, THEME_LIGHT_KEY, type ImportPlan } from '../../../../../utils/appearanceImportPlan';
 import { isFontFamilyAvailable } from '../../../../../utils/fontAvailability';
 import { isLibraryWallSeamStyle } from '../../../../../utils/libraryWallSeamStyle';
@@ -136,6 +139,9 @@ export const applyImportedConfig = (config: any, keys: string[], theme: ConfigTh
     if (has('visualizerOpacity')) {
         storeVisualizer.handleSetVisualizerOpacity(config.visualizerOpacity);
     }
+    if (has('playerHeaderBlur')) {
+        usePlayerChromeSettingsStore.getState().handleTogglePlayerHeaderBlur(Boolean(config.playerHeaderBlur));
+    }
     if (has('hidePlayerTranslationSubtitle')) {
         storeTypographySettings.handleToggleHidePlayerTranslationSubtitle(Boolean(config.hidePlayerTranslationSubtitle));
     }
@@ -148,6 +154,10 @@ export const applyImportedConfig = (config: any, keys: string[], theme: ConfigTh
             || config.subtitleContentMode === 'both'
             || config.subtitleContentMode === 'none')) {
         storeTypographySettings.handleSetSubtitleContentMode(config.subtitleContentMode);
+    }
+    const subtitleOverlayLayout = has('subtitleOverlayLayout') ? parseSubtitleOverlayLayout(config.subtitleOverlayLayout) : null;
+    if (subtitleOverlayLayout) {
+        storeTypographySettings.handleSetSubtitleOverlayLayout(subtitleOverlayLayout);
     }
     if (has('subtitleOverlayBackground')) {
         storeTypographySettings.handleToggleSubtitleOverlayBackground(Boolean(config.subtitleOverlayBackground));
@@ -321,6 +331,9 @@ export const applyImportedConfig = (config: any, keys: string[], theme: ConfigTh
     if (has('stageTrackPillOnHome')) {
         storeStageSettings.handleToggleStageTrackPillOnHome(Boolean(config.stageTrackPillOnHome));
     }
+    if (has('stageTrackPillInObs')) {
+        storeStageSettings.handleToggleStageTrackPillInObs(Boolean(config.stageTrackPillInObs));
+    }
     // The bravais wall: the collections' stack edges, the seam's material and direction, and the picture behind
     // the wall, through the setters the Bravais group on the 主页与歌单 page uses. The seam style
     // is taken only when it is a known preset, as the import plan's guard does.
@@ -342,5 +355,9 @@ export const applyImportedConfig = (config: any, keys: string[], theme: ConfigTh
     }
     if (has('libraryWallSeamDirection') && isLibraryWallSeamDirection(config.libraryWallSeamDirection)) {
         storeLibraryWall.setSeamDirection(config.libraryWallSeamDirection);
+    }
+    // Numbering only the playing song, on both tile walls (the 播放页 page's tile wall group writes it).
+    if (has('latticeBadgeCurrentOnly')) {
+        useLatticeSettingsStore.getState().handleToggleLatticeBadgeCurrentOnly(Boolean(config.latticeBadgeCurrentOnly));
     }
 };
