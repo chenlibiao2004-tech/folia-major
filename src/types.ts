@@ -52,13 +52,18 @@ export type SubtitleContentMode = 'translation' | 'romanization' | 'both' | 'non
 // One row of the shared bottom subtitle overlay: the line on screen, the line after it, or the line on screen's translation / romanization.
 export type SubtitleOverlayRowSource = 'current' | 'next' | 'translation' | 'romanization';
 export type SubtitleOverlayFollowRow = Exclude<SubtitleOverlayRowSource, 'current'>;
-// The shared bottom subtitle overlay's rows, top to bottom, joined with '+' (stored and carried as this string).
-// One row is the current line, its translation or its romanization; two or three rows open with the current line,
-// and each row after it is the next line, the translation or the romanization.
-export type SubtitleOverlayLayout =
-  | Exclude<SubtitleOverlayRowSource, 'next'>
-  | `current+${SubtitleOverlayFollowRow}`
-  | `current+${SubtitleOverlayFollowRow}+${SubtitleOverlayFollowRow}`;
+// The shared bottom subtitle overlay's rows, top to bottom, joined with '+'.
+// The first row is the current line, its translation or its romanization (so a stack can leave the original text out);
+// each row after it is the next line, the translation or the romanization.
+export type SubtitleOverlayFirstRow = Exclude<SubtitleOverlayRowSource, 'next'>;
+export type SubtitleOverlayRowsLayout =
+  | SubtitleOverlayFirstRow
+  | `${SubtitleOverlayFirstRow}+${SubtitleOverlayFollowRow}`
+  | `${SubtitleOverlayFirstRow}+${SubtitleOverlayFollowRow}+${SubtitleOverlayFollowRow}`;
+// A line the rows have nothing for (a translation row on a song without one) previews the coming lyrics instead.
+// The '|only' ending turns that off: the overlay then shows its rows and nothing else.
+// Stored and carried as this string.
+export type SubtitleOverlayLayout = SubtitleOverlayRowsLayout | `${SubtitleOverlayRowsLayout}|only`;
 
 export interface LyricAgent {
   id: string;
@@ -147,7 +152,7 @@ export type VisualizerFrameRate = 'off' | 120 | 90 | 60;
 export type LyricRenderScale = 0.5 | 0.75 | 1 | 1.5 | 2;
 /** 歌词画布的抗锯齿：auto 是各样式自己的默认（有的开 MSAA，有的靠后处理）。 */
 export type LyricAntialias = 'auto' | 'on' | 'off';
-/** 「性能与动效」里的全局挡位：各样式默认跟随它。 */
+/** 「动画与性能」里的全局挡位：各样式默认跟随它。 */
 export interface LyricRenderQuality {
   scale: LyricRenderScale;
   antialias: LyricAntialias;
@@ -227,12 +232,32 @@ export type StageLyricSource =
   | StageNavidromeLyricSource
   | StageQrcLyricSource;
 
+/** Where an external player is, as last reported to the Stage API (POST /stage/lyrics or /stage/lyrics/clock). */
+export interface StageLyricsClock {
+  positionMs: number;
+  paused: boolean;
+  /** The main process's Date.now() when the position was received; the clock runs on from it. */
+  sampledAtMs: number;
+}
+
 export interface StageLyricsSession {
   title?: string;
   artist?: string;
   album?: string;
-  lyricSource: StageLyricSource;
+  /** Absent for a session that only shows a track (its lyrics not found, or not here yet). */
+  lyricSource?: StageLyricSource;
+  durationMs?: number;
+  coverUrl?: string;
+  /** Present when an external player drives the session's time. */
+  clock?: StageLyricsClock;
   updatedAt: number;
+}
+
+/** What POST /stage/lyrics/clock sends to the window: the clock of the session with that `updatedAt`. */
+export interface StageLyricsClockUpdate {
+  sessionUpdatedAt: number;
+  clock: StageLyricsClock;
+  durationMs?: number;
 }
 
 export interface StageMediaSession {
@@ -464,7 +489,7 @@ export const DEFAULT_CLASSIC_TUNING: ClassicTuning = {
 };
 
 export interface CadenzaTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   fontScale: number;
   widthRatio: number;
@@ -500,7 +525,7 @@ export const DEFAULT_PARTITA_TUNING: PartitaTuning = {
 };
 
 export interface FumeTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   hidePrintSymbols: boolean;
   disableGeometricBackground: boolean;
@@ -570,7 +595,7 @@ export const DEFAULT_TILT_TUNING: TiltTuning = {
 };
 
 export interface PendoloTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   arcRadius: number;
   arcAngleDeg: number;
@@ -582,6 +607,20 @@ export interface PendoloTuning {
   showCenterGradient?: boolean;
   showCoverOnWatchFace?: boolean;
   enableLineGlow?: boolean;
+  /** 歌词左右镜像（#1124）：表盘移到右边、歌词弧线在左；wheelCenterX 改从右边缘量。 */
+  mirrorLayout?: boolean;
+  /** 表盘倾斜（度，正值时倾斜轴上方往屏幕里退）：表盘平面带透视地转出屏幕，0 是平放。 */
+  tiltDeg?: number;
+  /** 倾斜轴的方向（度）：0 是水平轴（前后俯仰），±90 是竖直轴（左右偏转）。 */
+  tiltAxisDeg?: number;
+  /** 分层视差强度：倾斜时齿轮、摆轮、歌词按各自高度浮在表盘上方，0 是全在一个平面上。 */
+  parallaxDepth?: number;
+  /** 轮心视角：相机在轮心后上方、顺着刻度针看向焦点句，代替倾斜；只在 WebGL 下生效。 */
+  hubView?: boolean;
+  /** 轮心视角的相机高度（轮盘半径的倍数）：低时贴着表盘平视，高时接近俯视。 */
+  hubViewHeight?: number;
+  /** 轮心视角的相机从轮心沿刻度针反方向后退多远（轮盘半径的倍数），0 是正在轮心上方。 */
+  hubViewBack?: number;
 }
 
 export const DEFAULT_PENDOLO_TUNING: PendoloTuning = {
@@ -596,12 +635,19 @@ export const DEFAULT_PENDOLO_TUNING: PendoloTuning = {
   showCenterGradient: true,
   showCoverOnWatchFace: false,
   enableLineGlow: false,
+  mirrorLayout: false,
+  tiltDeg: 0,
+  tiltAxisDeg: 0,
+  parallaxDepth: 1,
+  hubView: false,
+  hubViewHeight: 1.4,
+  hubViewBack: 1.2,
 };
 
 export type SonnetOuterFrameMode = 'none' | 'frame' | 'full';
 
 export interface SonnetTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   cameraIntensity: number;
   typographyMotion: number;
@@ -739,7 +785,7 @@ export const DEFAULT_TEMPERA_LAYER_IMAGE: Omit<TemperaLayerImage, 'id' | 'name'>
 };
 
 export interface TemperaTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   cameraIntensity: number;
   /** Per-glyph entrance motion strength, 0..2. */
@@ -833,7 +879,7 @@ export const DEFAULT_TEMPERA_TUNING: TemperaTuning = {
 export type LumiereRenderQuality = 'full' | 'balanced' | 'low';
 
 export interface LumiereTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   /** 光强倍率, 0.3..2. */
   lightIntensity: number;
@@ -979,7 +1025,7 @@ export const DIORAMA_PARTICLE_GLOW_INTENSITY_MAX = 1.5;
 export const DIORAMA_PARTICLE_GLOW_INTENSITY_STEP = 0.05;
 
 export interface DioramaTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   cameraSpeed: number;
   motionAmount: number;
@@ -1127,7 +1173,7 @@ export interface SoraBackgroundTuning {
 }
 
 export interface MonetTuning {
-  /** 分辨率与抗锯齿（#929）：默认跟随「性能与动效」里的全局挡位（utils/lyricRenderQuality.ts）。 */
+  /** 分辨率与抗锯齿（#929）：默认跟随「动画与性能」里的全局挡位（utils/lyricRenderQuality.ts）。 */
   render: LyricRenderOverride;
   keywordColoringEnabled: boolean;
   showDescription: boolean;
@@ -1275,6 +1321,10 @@ export enum PlayerState {
 }
 
 export interface StatusMessage {
+  /** Shows a decorative loader beside the visible status text. */
+  activity?: 'loading' | 'success' | 'error';
+  /** Keeps one loader mounted while its strokes morph into the result. */
+  activityId?: number;
   type: 'error' | 'success' | 'info';
   text: string;
   /** A second line under the text: what to do about it. */
